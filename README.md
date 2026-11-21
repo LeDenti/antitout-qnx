@@ -1,5 +1,7 @@
 # antiTOUT for QNX — the immune black box
 
+**Demo video (2:35, recorded live on QNX 8.0): https://youtu.be/DbMpyTTJHqI**
+
 A real-time compounding robot on QNX 8.0, guarded by two halves that only work together:
 
 * **the black box** proves what happened: every event is hash-chained with SHA3-256, sealed with
@@ -39,7 +41,7 @@ memory, announced by a non-blocking pulse. Signing runs at low priority.
 | Foreign process at FIFO 45 (above the 40 loop) | `QUARANTINE` 45 -> 1 via `SchedSet` |
 | Same binary comes back and raises its priority | recognised by immune memory, `EXPEL` |
 | Foreign binary opens `/dev/boitenoire` for writing | `EACCES` in the resmgr open handler, `MEMBRANE_REFUSE` sealed at once |
-| Rewrite history: 500 mg dose turned into 5000 mg on a copy | `bn_verify`: `TAMPERED: event content altered, event seq 14` |
+| Rewrite history: 500 mg dose turned into 5000 mg on a copy | `bn_verify`: `TAMPERED: event content altered, event seq 17` |
 
 * Found on the target, fixed: the first hunt killed `devb-eide`, `pci-server` and `slogger2`
   (an autoimmune disease: their interrupt threads run at 254 and they were not in the self).
@@ -49,6 +51,11 @@ memory, announced by a non-blocking pulse. Signing runs at low priority.
 * Timings under full software emulation (QEMU TCG on an Apple M5): ML-DSA-65 seal 15 ms,
   SLH-DSA-128s root 2.5 s, dispensing loop worst lateness 2-4 ms. The whole guest can stall
   over 50 ms there, so the demo sets `ANTITOUT_HB_MS=300`; on hardware or KVM keep the 50 ms default.
+* Found while filming, fixed: pulses queue by priority, so antiTOUT's watch timer (priority 50)
+  overtook the dosing loop's heartbeats (priority 40) still waiting in its channel and raised false
+  missed-deadline alerts of ~1.3 s. antiTOUT now drains every queued pulse (`MsgReceivePulse`
+  with a zero `TimerTimeout`) before it judges lateness. Also: no second quarantine of a thread
+  already at priority 1, and no `INTRUDER` record for a process already gone.
 
 ## Build
 
