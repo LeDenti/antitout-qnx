@@ -131,8 +131,9 @@ static void quarantine(pid_t pid, const char *why) {
     memset(&t, 0, sizeof t);
     t.tid = 1;
     while (devctl(fd, DCMD_PROC_TIDSTATUS, &t, sizeof t, NULL) == EOK) {
+        if (t.real_priority <= PRIO_QUARANTINE) { t.tid++; continue; }   /* already held */
         struct sched_param sp = { .sched_priority = PRIO_QUARANTINE };
-        int old = t.priority;
+        int old = t.real_priority;
         if (SchedSet(pid, (int)t.tid, SCHED_NOCHANGE, &sp) != -1) {
             bn_immune_payload p = { .pid = (uint32_t)pid, .tid = (uint32_t)t.tid,
                                     .old_prio = (uint32_t)old, .new_prio = PRIO_QUARANTINE };
@@ -230,6 +231,55 @@ static void lock_down(void) {
         PROCMGR_AID_EOL);
 }
 
+/* Every pulse except the watch timer. */
+static void on_pulse(const struct _pulse *pl) {
+    uint64_t now = bn_now_mono_ns();
+    switch (pl->code) {
+    case _PULSE_CODE_DISCONNECT:
+        ConnectDetach(pl->scoid);
+        break;
+    case CODE_HEARTBEAT: {
+        last_hb = now;
+        int late = pl->value.sival_int;
+        if (late > JITTER_LIMIT_US) {
+            if (++bad_jitter >= 3) { hunt("loop lateness"); bad_jitter = 0; }
+            clean_since = 0;
+        } else {
+            bad_jitter = 0;
+            if (!clean_since) clean_since = now;
+            if (robot_stopped && now - clean_since > 3000000000ull) {   /* 3 s clean: resume */
+                MsgSendPulse(doseur_coid, PRIO_ANTITOUT, CODE_RESUME, 0);
+                robot_stopped = 0; doses_out = 0;
+                uint32_t v[2] = { (uint32_t)soi.n, 1 };
+                record(BN_T_RELEASE, v, sizeof v);
+                printf("antitout: loop clean for 3 s, robot resumed\n");
+            }
+        }
+        break;
+    }
+    case CODE_DOSE_OUT: {
+        int32_t dev = pl->value.sival_int;
+        record(BN_T_DOSE_REFUSED, &dev, sizeof dev);
+        printf("antitout: dose out of tolerance (%+.2f %%)\n", dev / 1e4);
+        hunt("dose out of tolerance");
+        if (++doses_out >= 2) safe_stop();
+        break;
+    }
+    case CODE_MEMBRANE: {
+        pid_t pid = pl->value.sival_int;
+        bn_immune_payload p = { .pid = (uint32_t)pid };
+        uint8_t h[BN_HASH_LEN];
+        /* gone already (expelled after an earlier try): the black box journaled the refusal */
+        if (soi_hash_pid(pid, h, p.name, sizeof p.name) != 0) break;
+        memcpy(p.exe_hash8, h, 8);
+        record(BN_T_INTRUDER, &p, sizeof p);
+        printf("antitout: INTRUDER %s (pid %d) knocked on the black box\n", p.name, (int)pid);
+        quarantine(pid, "membrane refusal");
+        break;
+    }
+    }
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);   /* logs reach a file line by line */
     if (getenv("ANTITOUT_HB_MS")) HEARTBEAT_LATE_NS = strtoull(getenv("ANTITOUT_HB_MS"), NULL, 10) * 1000000ull;
@@ -268,60 +318,27 @@ int main(int argc, char **argv) {
             if (msg.type == _IO_CONNECT) MsgReply(rcvid, EOK, NULL, 0); else MsgError(rcvid, ENOSYS);
             continue;
         }
+        if (msg.pulse.code != CODE_WATCH_TIMER) { on_pulse(&msg.pulse); continue; }
+
+        /* Watch timer. Pulses are queued by priority, so this one (50) overtakes heartbeats (40)
+         * already waiting behind it, typically after a long hunt. Take what is queued, then judge. */
+        struct _pulse q;
+        for (;;) {
+            uint64_t zero = 0;
+            TimerTimeout(CLOCK_MONOTONIC, _NTO_TIMEOUT_RECEIVE, NULL, &zero, NULL);
+            if (MsgReceivePulse(att->chid, &q, sizeof q, NULL) == -1) break;   /* queue empty */
+            if (q.code == CODE_WATCH_TIMER) watch++; else on_pulse(&q);
+        }
         uint64_t now = bn_now_mono_ns();
-        switch (msg.pulse.code) {
-        case _PULSE_CODE_DISCONNECT:
-            ConnectDetach(msg.pulse.scoid);
-            break;
-        case CODE_HEARTBEAT: {
-            last_hb = now;
-            int late = msg.pulse.value.sival_int;
-            if (late > JITTER_LIMIT_US) {
-                if (++bad_jitter >= 3) { hunt("loop lateness"); bad_jitter = 0; }
-                clean_since = 0;
-            } else {
-                bad_jitter = 0;
-                if (!clean_since) clean_since = now;
-                if (robot_stopped && now - clean_since > 3000000000ull) {   /* 3 s clean: resume */
-                    MsgSendPulse(doseur_coid, PRIO_ANTITOUT, CODE_RESUME, 0);
-                    robot_stopped = 0; doses_out = 0;
-                    uint32_t v[2] = { (uint32_t)soi.n, 1 };
-                    record(BN_T_RELEASE, v, sizeof v);
-                    printf("antitout: loop clean for 3 s, robot resumed\n");
-                }
-            }
-            break;
+        find_doseur();
+        if (doseur_coid >= 0 && now > last_hb && now - last_hb > HEARTBEAT_LATE_NS && now > incident_until) {
+            uint32_t ms = (uint32_t)((now - last_hb) / 1000000);
+            record(BN_T_DEADLINE_MISSED, &ms, sizeof ms);
+            printf("antitout: no heartbeat for %u ms, hunting\n", ms);
+            if (!hunt("missed deadline")) printf("antitout: no foreign culprit found\n");
+            incident_until = bn_now_mono_ns() + 200000000ull;
         }
-        case CODE_DOSE_OUT: {
-            int32_t dev = msg.pulse.value.sival_int;
-            record(BN_T_DOSE_REFUSED, &dev, sizeof dev);
-            printf("antitout: dose out of tolerance (%+.2f %%)\n", dev / 1e4);
-            hunt("dose out of tolerance");
-            if (++doses_out >= 2) safe_stop();
-            break;
-        }
-        case CODE_MEMBRANE: {
-            pid_t pid = msg.pulse.value.sival_int;
-            bn_immune_payload p = { .pid = (uint32_t)pid };
-            uint8_t h[BN_HASH_LEN];
-            if (soi_hash_pid(pid, h, p.name, sizeof p.name) == 0) memcpy(p.exe_hash8, h, 8);
-            record(BN_T_INTRUDER, &p, sizeof p);
-            printf("antitout: INTRUDER %s (pid %d) knocked on the black box\n", p.name, (int)pid);
-            quarantine(pid, "membrane refusal");
-            break;
-        }
-        case CODE_WATCH_TIMER:
-            find_doseur();
-            if (doseur_coid >= 0 && now > last_hb && now - last_hb > HEARTBEAT_LATE_NS && now > incident_until) {
-                uint32_t ms = (uint32_t)((now - last_hb) / 1000000);
-                record(BN_T_DEADLINE_MISSED, &ms, sizeof ms);
-                printf("antitout: no heartbeat for %u ms, hunting\n", ms);
-                if (!hunt("missed deadline")) printf("antitout: no foreign culprit found\n");
-                incident_until = now + 200000000ull;
-            }
-            if (++watch % 100 == 0) hunt("periodic scan");          /* every second */
-            break;
-        }
+        if (++watch % 100 == 0) hunt("periodic scan");          /* about every second */
     }
     return 0;
 }

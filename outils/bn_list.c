@@ -22,9 +22,11 @@ static void payload(char *out, size_t n, uint16_t type, const uint8_t *p) {
     switch (type >> 8) {
     case 0x01:                                       /* bn_dose_payload */
         memcpy(s, p, 16); s[16] = 0;
-        snprintf(out, n, "%s target %.2f mg delivered %.2f mg deviation %+.2f %% jitter %u us pid %u",
-                 s, g32(p + 16) / 100.0, g32(p + 20) / 100.0, (int32_t)g32(p + 24) / 1e4,
-                 g32(p + 28), g32(p + 32));
+        if (type == BN_T_DOSE_DELIVERED)
+            snprintf(out, n, "%s target %.2f mg delivered %.2f mg (%+.2f %%) worst late %u us",
+                     s, g32(p + 16) / 100.0, g32(p + 20) / 100.0, (int32_t)g32(p + 24) / 1e4, g32(p + 28));
+        else
+            snprintf(out, n, "%s %.2f mg, prescriber pid %u", s, g32(p + 16) / 100.0, g32(p + 32));
         return;
     case 0x02:
         if (type == BN_T_SELF_OK) {
@@ -32,8 +34,10 @@ static void payload(char *out, size_t n, uint16_t type, const uint8_t *p) {
             return;
         }
         memcpy(s, p + 24, 16); s[16] = 0;            /* bn_immune_payload */
-        snprintf(out, n, "%s pid %u tid %u priority %u -> %u exe %02x%02x%02x%02x...",
-                 s[0] ? s : "?", g32(p), g32(p + 4), g32(p + 8), g32(p + 12), p[16], p[17], p[18], p[19]);
+        if (type == BN_T_QUARANTINE)
+            snprintf(out, n, "%s pid %u thread %u priority %u -> %u", s[0] ? s : "?", g32(p), g32(p + 4), g32(p + 8), g32(p + 12));
+        else
+            snprintf(out, n, "%s pid %u exe sha3 %02x%02x%02x%02x...", s[0] ? s : "?", g32(p), p[16], p[17], p[18], p[19]);
         return;
     default:
         snprintf(out, n, "%u %u", g32(p), g32(p + 4));
